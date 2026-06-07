@@ -1,0 +1,11 @@
+{
+  "name": "espai-mac-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build --compile ./server.ts --outfile ./dist/espai-mac-service",
+    "dev": "bun run server.ts",
+    "start": "bun run server.ts"
+  }
+}
