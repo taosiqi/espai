@@ -5,12 +5,14 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 #include <time.h>
 
 #include "ST7305_U8g2.h"
 #include "adc_bsp.h"
 #include "board_pins.h"
+#include "codec_bsp.h"
 #include "i2c_bsp.h"
 #include "i2c_equipment.h"
 
@@ -47,8 +49,27 @@ enum AppPage : uint8_t {
   PAGE_QUOTA = 0,
   PAGE_ENV,
   PAGE_POWER,
+  PAGE_POMODORO,
   PAGE_DEBUG,
   PAGE_COUNT
+};
+
+enum PomodoroMode : uint8_t {
+  POMODORO_IDLE = 0,
+  POMODORO_RUNNING,
+  POMODORO_PAUSED,
+  POMODORO_DONE,
+  POMODORO_RECORDING,
+  POMODORO_PLAYING,
+  POMODORO_AUDIO_ERROR
+};
+
+struct PomodoroState {
+  PomodoroMode mode = POMODORO_IDLE;
+  uint32_t durationSec = 25UL * 60UL;
+  uint32_t remainingSec = 25UL * 60UL;
+  uint32_t lastTickMs = 0;
+  String audioStatus = "左长按录3秒回放";
 };
 
 struct ButtonState {
@@ -70,6 +91,7 @@ static U8G2 *u8g2 = nullptr;
 
 static I2cMasterBus i2cBus(BoardPins::I2C_SCL, BoardPins::I2C_SDA, BoardPins::I2C_PORT);
 static Shtc3Port *shtc3 = nullptr;
+static CodecPort *codec = nullptr;
 static Preferences prefs;
 static WebServer setupServer(80);
 static DNSServer dnsServer;
@@ -84,8 +106,12 @@ static uint8_t batteryLevel = 0;
 static int batteryRaw = 0;
 static bool setupMode = false;
 static AppPage currentPage = PAGE_QUOTA;
+static PomodoroState pomodoro;
 static ButtonState bootButton = {BoardPins::BOOT_KEY};
 static ButtonState gp18Button = {BoardPins::GP18_KEY};
+static uint8_t *audioBuffer = nullptr;
+static bool audioReady = false;
+static bool audioBusy = false;
 
 static uint32_t lastSensorReadMs = 0;
 static uint32_t lastClockReadMs = 0;
@@ -107,6 +133,7 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 35;
 constexpr uint32_t BUTTON_LONG_MS = 1200;
 constexpr uint32_t RESET_HOLD_MS = 5000;
+constexpr uint32_t AUDIO_RECORD_BYTES = 192000;
 constexpr byte DNS_PORT = 53;
 
 static const char *pageTitle(AppPage page)
@@ -115,6 +142,7 @@ static const char *pageTitle(AppPage page)
     case PAGE_QUOTA: return "用量";
     case PAGE_ENV: return "环境";
     case PAGE_POWER: return "电源";
+    case PAGE_POMODORO: return "番茄钟";
     case PAGE_DEBUG: return "诊断";
     default: return "espai";
   }
@@ -492,6 +520,145 @@ static bool syncRtcFromNtp(uint32_t timeoutMs)
                 lastRtc.minute,
                 lastRtc.second);
   return true;
+}
+
+static void initAudio()
+{
+  audioBuffer = (uint8_t *)heap_caps_malloc(AUDIO_RECORD_BYTES, MALLOC_CAP_SPIRAM);
+  if (audioBuffer == nullptr) {
+    pomodoro.audioStatus = "音频缓存失败";
+    Serial.println("Audio buffer allocation failed");
+    return;
+  }
+
+  codec = new CodecPort(i2cBus, "S3_RLCD_4_2");
+  codec->setInfo("es8311 & es7210", true, 16000, 2, 16);
+  codec->setSpeakerVol(90);
+  codec->setMicGain(35);
+  audioReady = true;
+  pomodoro.audioStatus = "左长按录3秒回放";
+  Serial.println("Audio codec ready");
+}
+
+static void playTone(int frequency, int durationMs)
+{
+  if (!audioReady || audioBuffer == nullptr || audioBusy) {
+    return;
+  }
+
+  audioBusy = true;
+  codec->setInfo("es8311", true, 16000, 2, 16);
+  codec->setSpeakerVol(90);
+
+  const int sampleRate = 16000;
+  const int samples = min((int)(AUDIO_RECORD_BYTES / 4), (sampleRate * durationMs) / 1000);
+  int16_t *pcm = (int16_t *)audioBuffer;
+  for (int i = 0; i < samples; i++) {
+    float phase = (2.0f * PI * frequency * i) / sampleRate;
+    int16_t value = (int16_t)(sinf(phase) * 9000);
+    pcm[i * 2] = value;
+    pcm[i * 2 + 1] = value;
+  }
+  codec->playWrite(audioBuffer, samples * 4);
+  audioBusy = false;
+}
+
+static void playPomodoroDoneSound()
+{
+  playTone(880, 180);
+  delay(60);
+  playTone(1175, 240);
+}
+
+static const char *pomodoroModeText()
+{
+  switch (pomodoro.mode) {
+    case POMODORO_RUNNING: return "专注中";
+    case POMODORO_PAUSED: return "已暂停";
+    case POMODORO_DONE: return "完成";
+    case POMODORO_RECORDING: return "录音中";
+    case POMODORO_PLAYING: return "回放中";
+    case POMODORO_AUDIO_ERROR: return "音频异常";
+    default: return "待开始";
+  }
+}
+
+static void togglePomodoro()
+{
+  uint32_t now = millis();
+  if (pomodoro.mode == POMODORO_RUNNING) {
+    pomodoro.mode = POMODORO_PAUSED;
+  } else {
+    if (pomodoro.mode == POMODORO_DONE || pomodoro.remainingSec == 0) {
+      pomodoro.remainingSec = pomodoro.durationSec;
+    }
+    pomodoro.mode = POMODORO_RUNNING;
+    pomodoro.lastTickMs = now;
+  }
+  drawCurrentPage();
+}
+
+static void updatePomodoro()
+{
+  if (pomodoro.mode != POMODORO_RUNNING) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (pomodoro.lastTickMs == 0) {
+    pomodoro.lastTickMs = now;
+    return;
+  }
+
+  uint32_t elapsed = (now - pomodoro.lastTickMs) / 1000;
+  if (elapsed == 0) {
+    return;
+  }
+  pomodoro.lastTickMs += elapsed * 1000;
+
+  if (elapsed >= pomodoro.remainingSec) {
+    pomodoro.remainingSec = 0;
+    pomodoro.mode = POMODORO_DONE;
+    pomodoro.audioStatus = "番茄完成提示音";
+    playPomodoroDoneSound();
+  } else {
+    pomodoro.remainingSec -= elapsed;
+  }
+}
+
+static void recordAndPlayback()
+{
+  if (!audioReady || codec == nullptr || audioBuffer == nullptr || audioBusy) {
+    pomodoro.mode = POMODORO_AUDIO_ERROR;
+    pomodoro.audioStatus = "音频未就绪";
+    drawCurrentPage();
+    return;
+  }
+
+  audioBusy = true;
+  PomodoroMode before = pomodoro.mode;
+
+  pomodoro.mode = POMODORO_RECORDING;
+  pomodoro.audioStatus = "录音中 3 秒";
+  drawCurrentPage();
+  codec->setInfo("es8311 & es7210", true, 16000, 2, 16);
+  codec->setMicGain(35);
+  int readRet = codec->recordRead(audioBuffer, AUDIO_RECORD_BYTES);
+
+  pomodoro.mode = POMODORO_PLAYING;
+  pomodoro.audioStatus = readRet == 0 ? "正在回放" : "录音完成 回放";
+  drawCurrentPage();
+  codec->setSpeakerVol(95);
+  codec->playWrite(audioBuffer, AUDIO_RECORD_BYTES);
+
+  pomodoro.mode = before == POMODORO_RUNNING ? POMODORO_RUNNING : POMODORO_PAUSED;
+  if (pomodoro.remainingSec == pomodoro.durationSec && before == POMODORO_IDLE) {
+    pomodoro.mode = POMODORO_IDLE;
+  }
+  pomodoro.audioStatus = "录放测试完成";
+  pomodoro.lastTickMs = millis();
+  audioBusy = false;
+  drawCurrentPage();
 }
 
 static String htmlEscape(const String &value)
@@ -872,6 +1039,40 @@ static void drawPowerPage()
   u8g2->sendBuffer();
 }
 
+static void drawPomodoroPage()
+{
+  char text[64];
+  uint32_t minutes = pomodoro.remainingSec / 60;
+  uint32_t seconds = pomodoro.remainingSec % 60;
+  int elapsedPercent = 0;
+  if (pomodoro.durationSec > 0) {
+    elapsedPercent = (int)(((pomodoro.durationSec - pomodoro.remainingSec) * 100UL) / pomodoro.durationSec);
+  }
+
+  renderPageShell("番茄钟");
+  drawCard(18, 54, 364, 150, "番茄钟");
+
+  setCnFont();
+  drawText(34, 82, pomodoroModeText());
+
+  u8g2->setFont(u8g2_font_logisoso50_tn);
+  snprintf(text, sizeof(text), "%02lu:%02lu", (unsigned long)minutes, (unsigned long)seconds);
+  int width = u8g2->getUTF8Width(text);
+  drawText((BoardPins::LCD_WIDTH - width) / 2, 145, text);
+
+  drawProgress(42, 170, 316, 14, elapsedPercent);
+
+  drawCard(18, 214, 364, 48, "录放测试");
+  setCnFont();
+  drawText(34, 244, pomodoro.audioStatus.c_str());
+
+  u8g2->setFont(u8g2_font_6x13B_tf);
+  drawText(248, 244, audioReady ? "REC/PLAY OK" : "NO AUDIO");
+
+  drawFooter();
+  u8g2->sendBuffer();
+}
+
 static void drawDebugLine(int y, const char *label, const String &value)
 {
   char text[88];
@@ -906,6 +1107,7 @@ static void drawCurrentPage()
     case PAGE_QUOTA: drawQuotaPage(); break;
     case PAGE_ENV: drawEnvPage(); break;
     case PAGE_POWER: drawPowerPage(); break;
+    case PAGE_POMODORO: drawPomodoroPage(); break;
     case PAGE_DEBUG: drawDebugPage(); break;
     default: drawQuotaPage(); break;
   }
@@ -927,6 +1129,10 @@ static void handleShortPress(uint8_t pin)
   if (setupMode) {
     return;
   }
+  if (currentPage == PAGE_POMODORO && pin == BoardPins::GP18_KEY) {
+    togglePomodoro();
+    return;
+  }
   if (pin == BoardPins::BOOT_KEY) {
     changePage(1);
   } else if (pin == BoardPins::GP18_KEY) {
@@ -941,6 +1147,10 @@ static void handleLongPress(uint8_t pin)
     drawMessage("配置已清空", "正在重启配网");
     delay(700);
     ESP.restart();
+  }
+  if (!setupMode && currentPage == PAGE_POMODORO && pin == BoardPins::GP18_KEY) {
+    recordAndPlayback();
+    return;
   }
   if (!setupMode && pin == BoardPins::GP18_KEY) {
     drawMessage("正在刷新", "请求 Mac 服务");
@@ -1000,6 +1210,7 @@ void setup()
 
   Rtc_Setup(&i2cBus, BoardPins::RTC_ADDR);
   readClock();
+  initAudio();
   Adc_PortInit();
   shtc3 = new Shtc3Port(i2cBus);
   readSensors();
@@ -1047,6 +1258,8 @@ void loop()
     lastSensorReadMs = now;
     readSensors();
   }
+
+  updatePomodoro();
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.reconnect();

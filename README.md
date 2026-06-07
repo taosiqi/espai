@@ -134,6 +134,7 @@ http://你的Mac局域网IP:8787/api/status
 - `用量`：5h 剩余额度大仪表、5h/7d 进度卡。
 - `环境`：温度、湿度、公历年月日时分秒、老历日期、Wi-Fi RSSI。
 - `电源`：电池估算百分比、电压、ADC 原始值。
+- `番茄钟`：25 分钟专注计时，并提供 3 秒录音回放测试。
 - `诊断`：Mac Host、实际请求 URL、HTTP 状态、数据源、刷新年龄。
 
 按键：
@@ -142,6 +143,11 @@ http://你的Mac局域网IP:8787/api/status
 - 右键 BOOT 短按：下一页。
 - 左键 GP18 长按：立即刷新 Codex quota。
 - 右键 BOOT 长按 5 秒：清空配置并重启进入配网页。
+
+在 `番茄钟` 页，左键有专门操作：
+
+- 左键 GP18 短按：开始/暂停番茄钟。
+- 左键 GP18 长按：录音 3 秒并立即回放，用来测试麦克风和喇叭。
 
 ## 中文显示
 
@@ -161,6 +167,7 @@ http://你的Mac局域网IP:8787/api/status
 - Display: 4.2 inch RLCD, 300 x 400, ST7305 over SPI
 - Sensor: SHTC3
 - RTC: PCF85063
+- Audio codec: ES8311 speaker output + ES7210 microphone input
 
 ## 引脚
 
@@ -175,9 +182,19 @@ http://你的Mac局域网IP:8787/api/status
 | I2C SDA | 13 |
 | BOOT 右键/重置键 | 0 |
 | GP18 左键/刷新键 | 18 |
+| Audio MCLK | 16 |
+| Audio BCLK | 9 |
+| Audio WS | 45 |
+| Audio DIN | 10 |
+| Audio DOUT | 8 |
+| Audio PA | 46 |
 | 电池 ADC | ADC1 CH3 |
 | RTC I2C 地址 | 0x51 |
 | SHTC3 I2C 地址 | 0x70 |
+
+## 录音播放
+
+项目复用了 Waveshare `07_Audio_Test` 示例里的 codec 驱动。板载/外接喇叭通过 ES8311 播放，麦克风通过 ES7210 录音；番茄钟页长按左键会录制约 3 秒 PCM 到 PSRAM，然后直接回放。番茄钟结束时也会播放一段短提示音。
 
 如果使用 Waveshare 示例包里的本地库，它们在：
 
