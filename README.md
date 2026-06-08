@@ -1,6 +1,6 @@
 # espai
 
-这是一个基于 Waveshare ESP32-S3-RLCD-4.2 的 Arduino IDE 项目，用来在 RLCD 屏幕上显示当前 Mac Codex 账号的 5h/7d 剩余额度。界面是黑白屏上的 Notion 风网页仪表盘，并保留 RTC、温湿度、Wi-Fi 和电池状态小组件。
+这是一个基于 Waveshare ESP32-S3-RLCD-4.2 的 Arduino IDE 项目，用来在 RLCD 屏幕上显示当前 Mac Codex 账号的 5h/7d 剩余额度。界面是黑白屏上的 Notion 风网页仪表盘，并保留 RTC、温湿度、蓝牙连接和电池状态小组件。
 
 ## Arduino IDE 使用
 
@@ -27,112 +27,77 @@
 
 ## Mac 服务
 
-ESP32 不能直接读取 Mac 上的 Codex app-server，所以需要在 Mac 本地跑一个很小的 Bun 服务，把 Codex quota 转成 ESP32 可访问的 JSON。
-
-安装 Bun：
-
-```sh
-curl -fsSL https://bun.sh/install | bash
-```
-
-安装后新开一个终端，或运行：
-
-```sh
-exec /bin/zsh
-```
-
-配置服务：
-
-```sh
-cd mac-service
-cp .env.example .env
-```
-
-编辑 `.env`：
-
-```text
-ESPAI_HOST=0.0.0.0
-ESPAI_PORT=8787
-CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
-```
+Mac 本地使用原生 `EspaiBleBridge.app` 读取 Codex session log 里的 quota 快照，再通过 BLE 写给 ESP32-S3。板子默认不连公司 Wi-Fi，而是广播 BLE 设备 `espai-s3`。
 
 ### 启动方式
 
-Bun 服务不一定要有 Terminal 黑窗口。黑窗口只代表服务在前台运行；如果改成 macOS 后台服务，ESP32 仍然可以访问接口，但桌面不会常驻黑窗口。
-
-前台启动，适合调试：
+安装后台 App：
 
 ```sh
-bun run dev
+cd mac-service
+./install-swift-ble-app.command
 ```
 
-这种方式会占用当前 Terminal 窗口，关掉窗口服务就会停止。
-
-后台启动，适合日常使用：
-
-```sh
-bun run build
-./install-background-service.command
-```
-
-后台服务由 launchd 管理，登录后自动启动，不需要保留 Terminal 窗口。安装脚本本身会短暂打开一个窗口显示结果，安装完成后可以关闭。
-
-日志位置：
+第一次运行时 macOS 可能会请求蓝牙权限，需要允许 `EspaiBleBridge` 使用蓝牙。安装完成后可以关闭脚本窗口；后台 App 会作为登录项自动启动，不需要常驻 Terminal 黑窗口。
 
 ```text
-~/.codex/espai-mac-service.out.log
-~/.codex/espai-mac-service.err.log
+~/.codex/espai-ble-bridge-app.log
 ```
 
-卸载后台服务：
+卸载后台 App：
 
 ```sh
-./uninstall-background-service.command
+cd mac-service
+./uninstall-swift-ble-app.command
 ```
 
-测试服务：
+Swift App 会解析 `~/.codex/sessions/*.jsonl` 里的 `token_count.rate_limits`，不需要 Bun、HTTP 服务或 Python bridge。
+
+## 蓝牙传输
+
+ESP32-S3-RLCD-4.2 使用的是 ESP32-S3，默认方案是 BLE，不使用经典蓝牙串口 SPP。Mac 作为 BLE Central，ESP32-S3 作为 BLE Peripheral。
+
+后台无窗口方式：
 
 ```sh
-curl http://127.0.0.1:8787/api/status
+cd mac-service
+./install-swift-ble-app.command
 ```
 
-服务启动时会打印可供 ESP32 配置页填写的 Mac IP 和完整 URL。每次读取数据时，也会在终端打印 quota 来源和 5h/7d 剩余百分比。
+Swift BLE App 会扫描 `espai-s3`，连接后每 60 秒推送一次 quota JSON。
 
-服务会调用本机 Codex app-server 的 `account/rateLimits/read`，优先读取 `rateLimitsByLimitId.codex`。如果 app-server 暂时拿不到数据，会回退解析 `~/.codex/sessions/*.jsonl` 里的 `token_count.rate_limits`。
-
-## 首次配网
-
-首次启动或清空配置后，屏幕会显示 `espai-setup` 和中文配网提示。
-
-1. 手机连接 Wi-Fi：`espai-setup`
-2. 浏览器打开：`http://192.168.4.1`
-3. 填入 Wi-Fi 和 Mac IP
-4. 保存后设备自动重启进入仪表模式
-
-Mac IP 示例：
+可用环境变量：
 
 ```text
-192.168.1.10
+ESPAI_BLE_POLL_SECONDS=60
 ```
 
-ESP32 会自动请求：
+BLE UUID：
 
 ```text
-http://你的Mac局域网IP:8787/api/status
+Service: d34d3b80-2e0b-4b7a-9d68-28db61b3d1a0
+Quota RX: d34d3b81-2e0b-4b7a-9d68-28db61b3d1a0
 ```
 
-配置带版本号；如果设备里保存的是旧版 URL/token 配置，新固件会自动清空并重新进入配网页。
+写入协议是简单分块：
 
-## 重置 Wi-Fi
+```text
+BEGIN:<json字节数>
+<json chunk 1>
+<json chunk 2>
+END
+```
 
-长按右键（BOOT/GPIO0）5 秒会清空 ESP32 保存的 Wi-Fi/服务配置，并重启进入 `espai-setup` 配网模式。
+## 重置
+
+长按右键（BOOT/GPIO0）5 秒会清空 ESP32 保存的旧配置并重启。当前默认是蓝牙模式，重启后会继续广播 `espai-s3`。
 
 ## 页面和按键
 
 主界面固定 4 页：
 
 - `用量`：5h 剩余额度大仪表、5h/7d 进度卡。
-- `环境`：温度、湿度、公历年月日时分秒、老历日期、Wi-Fi RSSI。
+- `环境`：温度、湿度、公历年月日时分秒、老历日期。
 - `电源`：电池估算百分比、电压、ADC 原始值。
 - `番茄钟`：25 分钟专注计时，并提供 3 秒录音回放测试。
 - `诊断`：Mac Host、实际请求 URL、HTTP 状态、数据源、刷新年龄。
@@ -141,8 +106,8 @@ http://你的Mac局域网IP:8787/api/status
 
 - 左键 GP18 短按：上一页。
 - 右键 BOOT 短按：下一页。
-- 左键 GP18 长按：立即刷新 Codex quota。
-- 右键 BOOT 长按 5 秒：清空配置并重启进入配网页。
+- 左键 GP18 长按：立即重绘当前状态。
+- 右键 BOOT 长按 5 秒：清空配置并重启。
 
 在 `番茄钟` 页，左键有专门操作：
 
@@ -157,7 +122,7 @@ http://你的Mac局域网IP:8787/api/status
 
 ## 时间校准
 
-设备连上 Wi-Fi 后会通过 NTP 校准北京时间，并写入 PCF85063 RTC；运行中每 6 小时会再次校准。离线时继续使用 RTC 走时，环境页会显示公历年月日时分秒和老历日期。
+BLE bridge 每次推送 quota 时会顺带发送 Mac 当前时间，ESP32-S3 收到后写入 PCF85063 RTC。没有收到蓝牙数据时，设备继续使用 RTC 走时。
 
 ## 硬件
 

@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 #include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -119,10 +122,14 @@ static uint32_t lastTimeSyncMs = 0;
 static uint32_t lastQuotaFetchMs = 0;
 static uint32_t lastDrawMs = 0;
 static bool timeSynced = false;
+static bool bleConnected = false;
+static String bleRxBuffer;
+static size_t bleExpectedBytes = 0;
 
 // 配置版本用来识别旧固件保存过的 URL/token。
 // 这版配置页只让用户填 Mac IP，版本不一致时会清空旧配置，避免继续访问上一次写错的地址。
 constexpr uint8_t CONFIG_VERSION = 2;
+constexpr bool BLE_QUOTA_MODE = true;
 constexpr uint32_t SENSOR_INTERVAL_MS = 5000;
 constexpr uint32_t CLOCK_INTERVAL_MS = 1000;
 constexpr uint32_t TIME_SYNC_RETRY_MS = 60000;
@@ -135,6 +142,9 @@ constexpr uint32_t BUTTON_LONG_MS = 1200;
 constexpr uint32_t RESET_HOLD_MS = 5000;
 constexpr uint32_t AUDIO_RECORD_BYTES = 192000;
 constexpr byte DNS_PORT = 53;
+static const char *BLE_DEVICE_NAME = "espai-s3";
+static const char *BLE_SERVICE_UUID = "d34d3b80-2e0b-4b7a-9d68-28db61b3d1a0";
+static const char *BLE_QUOTA_RX_UUID = "d34d3b81-2e0b-4b7a-9d68-28db61b3d1a0";
 
 static const char *pageTitle(AppPage page)
 {
@@ -406,7 +416,7 @@ static void drawHeader(const char *title)
   drawText(18, 27, "espai");
   setCnFont();
   drawText(90, 27, page);
-  drawChip(306, 11, WiFi.status() == WL_CONNECTED ? "在线" : "离线");
+  drawChip(306, 11, BLE_QUOTA_MODE ? (bleConnected ? "蓝牙" : "等待") : (WiFi.status() == WL_CONNECTED ? "在线" : "离线"));
   u8g2->drawHLine(16, 45, 368);
 }
 
@@ -845,6 +855,142 @@ static QuotaWindow parseQuotaWindow(JsonVariantConst value)
   return window;
 }
 
+static bool applyQuotaPayload(const String &payload, const char *transport)
+{
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    quota.ok = false;
+    quota.error = "JSON 错误";
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  if (!doc["ok"].as<bool>()) {
+    quota.ok = false;
+    quota.error = doc["error"].as<const char *>() ? doc["error"].as<const char *>() : "服务错误";
+    return false;
+  }
+
+  quota.ok = true;
+  quota.error = "";
+  quota.source = doc["source"].as<const char *>() ? doc["source"].as<const char *>() : transport;
+  quota.planType = doc["planType"].as<const char *>() ? doc["planType"].as<const char *>() : "--";
+  quota.limitName = doc["limitName"].as<const char *>() ? doc["limitName"].as<const char *>() : "--";
+  quota.primary = parseQuotaWindow(doc["primary"]);
+  quota.secondary = parseQuotaWindow(doc["secondary"]);
+  quota.updatedAt = doc["updatedAt"] | 0;
+  quota.localUpdatedMs = millis();
+
+  long nowEpoch = doc["now"] | 0;
+  if (nowEpoch > 0) {
+    time_t nowTime = (time_t)nowEpoch;
+    struct tm *localTime = localtime(&nowTime);
+    if (localTime != nullptr) {
+      Rtc_SetTime(
+          localTime->tm_year + 1900,
+          localTime->tm_mon + 1,
+          localTime->tm_mday,
+          localTime->tm_hour,
+          localTime->tm_min,
+          localTime->tm_sec);
+      readClock();
+      timeSynced = true;
+      lastTimeSyncMs = millis();
+    }
+  }
+
+  Serial.printf("Quota: %s %d%% remaining, %s %d%% remaining\n",
+                quota.primary.label.c_str(),
+                quota.primary.remainingPercent,
+                quota.secondary.label.c_str(),
+                quota.secondary.remainingPercent);
+  return true;
+}
+
+class EspaiBleServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override
+  {
+    bleConnected = true;
+    quota.error = "Mac 已连接";
+    Serial.println("BLE connected");
+  }
+
+  void onDisconnect(BLEServer *server) override
+  {
+    bleConnected = false;
+    quota.error = "等待 Mac 蓝牙";
+    Serial.println("BLE disconnected");
+    server->getAdvertising()->start();
+  }
+};
+
+class EspaiQuotaCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *characteristic) override
+  {
+    String value = characteristic->getValue().c_str();
+    if (value.length() == 0) {
+      return;
+    }
+
+    if (value.startsWith("BEGIN:")) {
+      bleExpectedBytes = (size_t)value.substring(6).toInt();
+      bleRxBuffer = "";
+      bleRxBuffer.reserve(bleExpectedBytes + 16);
+      quota.error = "蓝牙接收中";
+      Serial.printf("BLE quota begin: %u bytes\n", (unsigned)bleExpectedBytes);
+      return;
+    }
+
+    if (value == "END") {
+      if (bleExpectedBytes > 0 && bleRxBuffer.length() != bleExpectedBytes) {
+        quota.ok = false;
+        quota.error = "蓝牙数据不完整";
+        Serial.printf("BLE quota size mismatch: got %u expected %u\n",
+                      (unsigned)bleRxBuffer.length(),
+                      (unsigned)bleExpectedBytes);
+      } else {
+        quota.requestUrl = "BLE " + String(BLE_DEVICE_NAME);
+        quota.lastHttpCode = 200;
+        applyQuotaPayload(bleRxBuffer, "ble");
+        drawCurrentPage();
+      }
+      bleExpectedBytes = 0;
+      bleRxBuffer = "";
+      return;
+    }
+
+    bleRxBuffer += value;
+  }
+};
+
+static void startBleQuota()
+{
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(517);
+
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new EspaiBleServerCallbacks());
+
+  BLEService *service = server->createService(BLE_SERVICE_UUID);
+  BLECharacteristic *quotaRx = service->createCharacteristic(
+      BLE_QUOTA_RX_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  quotaRx->setCallbacks(new EspaiQuotaCallbacks());
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+
+  quota.ok = false;
+  quota.error = "等待 Mac 蓝牙";
+  quota.source = "ble";
+  quota.requestUrl = "BLE " + String(BLE_DEVICE_NAME);
+  Serial.println("BLE quota service advertising as espai-s3");
+}
+
 static bool fetchQuota()
 {
   if (WiFi.status() != WL_CONNECTED) {
@@ -880,37 +1026,7 @@ static bool fetchQuota()
     return false;
   }
 
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    quota.ok = false;
-    quota.error = "JSON 错误";
-    Serial.println(error.c_str());
-    return false;
-  }
-
-  if (!doc["ok"].as<bool>()) {
-    quota.ok = false;
-    quota.error = doc["error"].as<const char *>() ? doc["error"].as<const char *>() : "服务错误";
-    return false;
-  }
-
-  quota.ok = true;
-  quota.error = "";
-  quota.source = doc["source"].as<const char *>() ? doc["source"].as<const char *>() : "--";
-  quota.planType = doc["planType"].as<const char *>() ? doc["planType"].as<const char *>() : "--";
-  quota.limitName = doc["limitName"].as<const char *>() ? doc["limitName"].as<const char *>() : "--";
-  quota.primary = parseQuotaWindow(doc["primary"]);
-  quota.secondary = parseQuotaWindow(doc["secondary"]);
-  quota.updatedAt = doc["updatedAt"] | 0;
-  quota.localUpdatedMs = millis();
-
-  Serial.printf("Quota: %s %d%% remaining, %s %d%% remaining\n",
-                quota.primary.label.c_str(),
-                quota.primary.remainingPercent,
-                quota.secondary.label.c_str(),
-                quota.secondary.remainingPercent);
-  return true;
+  return applyQuotaPayload(payload, "http");
 }
 
 static long secondsUntil(long epoch)
@@ -1096,7 +1212,7 @@ static void drawDebugPage()
   drawDebugLine(184, "HTTP", String(text));
   snprintf(text, sizeof(text), "%ld 秒", quota.localUpdatedMs == 0 ? -1L : (long)((millis() - quota.localUpdatedMs) / 1000));
   drawDebugLine(206, "刷新", String(text));
-  drawDebugLine(228, "本机IP", WiFi.localIP().toString());
+  drawDebugLine(228, BLE_QUOTA_MODE ? "蓝牙" : "本机IP", BLE_QUOTA_MODE ? (bleConnected ? String("已连接") : String("等待连接")) : WiFi.localIP().toString());
   drawFooter();
   u8g2->sendBuffer();
 }
@@ -1153,6 +1269,11 @@ static void handleLongPress(uint8_t pin)
     return;
   }
   if (!setupMode && pin == BoardPins::GP18_KEY) {
+    if (BLE_QUOTA_MODE) {
+      quota.error = bleConnected ? "等待 Mac 推送" : "等待 Mac 蓝牙";
+      drawCurrentPage();
+      return;
+    }
     drawMessage("正在刷新", "请求 Mac 服务");
     lastQuotaFetchMs = millis();
     fetchQuota();
@@ -1215,6 +1336,14 @@ void setup()
   shtc3 = new Shtc3Port(i2cBus);
   readSensors();
 
+  if (BLE_QUOTA_MODE) {
+    startBleQuota();
+    drawMessage("蓝牙模式", "Mac 连接 espai-s3");
+    delay(800);
+    drawCurrentPage();
+    return;
+  }
+
   // If there is no current config, stay in AP mode so setup can be done from a phone.
   if (!loadConfig()) {
     startSetupMode();
@@ -1260,6 +1389,15 @@ void loop()
   }
 
   updatePomodoro();
+
+  if (BLE_QUOTA_MODE) {
+    if (now - lastDrawMs >= DRAW_INTERVAL_MS) {
+      lastDrawMs = now;
+      drawCurrentPage();
+    }
+    delay(20);
+    return;
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.reconnect();

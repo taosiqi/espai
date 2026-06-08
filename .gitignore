@@ -7,5 +7,4 @@ build/
 *.bin
 *.elf
 *.map
-mac-service/.env
-mac-service/dist/
+mac-service/EspaiBleBridge.app/
